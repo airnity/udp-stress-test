@@ -6,12 +6,16 @@ extern crate tokio_proto;
 extern crate tokio_service;
 extern crate tokio_timer;
 extern crate byteorder;
+extern crate buf_view;
 #[macro_use]
 extern crate clap;
 extern crate rand;
 
+
+
 use std::io;
 use std::net::IpAddr;
+use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::rc::Rc;
@@ -21,7 +25,7 @@ use clap::{Arg, App};
 
 use rand::{thread_rng, Rng};
 
-use byteorder::{ByteOrder, LittleEndian};
+//use byteorder::{ByteOrder, LittleEndian};
 
 use tokio_core::reactor::{Core, Handle};
 use tokio_core::net::{UdpSocket, UdpCodec};
@@ -36,7 +40,15 @@ use futures::sync::oneshot;
 use futures::IntoFuture;
 use futures::future::FutureResult;
 
-const MAX_PACKET_BYTES: usize = 1220;
+
+use buf_view::BufViewMut;
+use buf_view::BufView;
+
+
+
+
+const MAX_PACKET_SEND_BYTES: usize = 60;
+const MAX_PACKET_REPLY_BYTES: usize = 1412;
 
 mod my_adapters {
 	use futures::{Async, Stream, Poll};
@@ -110,7 +122,7 @@ fn delay_future(duration: Duration, handle: &Handle) -> futures::Flatten<FutureR
 	Timeout::new(duration, &handle).into_future().flatten()
 }
 
-fn run_server(bind_addr: &str, server_port: u16, buf: Vec<u8>, num_clients: usize) {
+fn run_server(bind_addr: &str, server_port: u16, _buf: Vec<u8>, num_clients: usize, reply_buf: Vec<u8>) {
 	let mut recv_counts = vec![0 as u64; num_clients];
 	let addr = SocketAddr::new(IpAddr::from_str(bind_addr).unwrap(), server_port);
 
@@ -122,11 +134,22 @@ fn run_server(bind_addr: &str, server_port: u16, buf: Vec<u8>, num_clients: usiz
 
 	let (sink, stream) = socket.framed(ServerCodec).split();
 
-	let count_stream = stream.map(|(addr, msg)| {
-		let client_id = LittleEndian::read_u16(&msg);
+	let count_stream = stream.map(|(mut addr, msg)| {
+		let mut buf_view = BufView::wrap(&msg);
+
+		let client_id = buf_view.get_u16(6);
+	//	println!("client_id {}", client_id);
 		recv_counts[client_id as usize] += 1;
 
-		(addr, msg) // TODO - send buf instead of echoing
+
+		let mut client_buf = reply_buf.clone();
+
+		let mut reply_buf_view = BufViewMut::wrap(&mut client_buf);
+		reply_buf_view.set_u16(6, client_id);
+
+		addr.set_port(2152);
+
+		(addr, client_buf) // TODO - send buf instead of echoing
 	});
 
 	let echo_stream = count_stream.forward(sink).and_then(|_| Ok(()));
@@ -135,14 +158,16 @@ fn run_server(bind_addr: &str, server_port: u16, buf: Vec<u8>, num_clients: usiz
 	println!("Result: {:?}", server);
 }
 
-fn run_client(server_ip: &str, server_port: u16, buf: &Vec<u8>, index: u16, randomize_starts: bool, run_duration: Duration, tick_rate_hz: u32, timer: Timer, handle: Handle, result_tx: oneshot::Sender<(u16, u64, u64)>) {
-	let addr = SocketAddr::new(IpAddr::from_str("0.0.0.0").unwrap(), 0);
+fn run_client(bind_addr: &str, server_ip: &str, server_port: u16, buf: &Vec<u8>, index: u16, randomize_starts: bool, run_duration: Duration, tick_rate_hz: u32, timer: Timer, handle: Handle, result_tx: oneshot::Sender<(u16, u64, u64)>) {
+	let addr = SocketAddr::new(IpAddr::from_str(bind_addr).unwrap(), server_port);
 	let server_addr = SocketAddr::new(IpAddr::from_str(server_ip).unwrap(), server_port);
 
 	let socket = UdpSocket::bind(&addr, &handle).unwrap();
 
 	let mut client_buf = buf.clone();
-	LittleEndian::write_u16(&mut client_buf, index);
+	let mut reply_buf_view = BufViewMut::wrap(&mut client_buf);
+	reply_buf_view.set_u16(6, index);
+
 
 	let send_data = Rc::new((server_addr, client_buf));
 	let (sink, stream) = socket.framed(ClientCodec).split();
@@ -250,30 +275,78 @@ fn main() {
 			.short("p")
 			.long("port")
 			.takes_value(true)
-			.help("Port the server runs on (and the client connects to (default 55777)"))
+			.help("Port the server runs on (and the client connects to (default 2152)"))
 		.arg(Arg::with_name("bind_addr")
 			.short("b")
 			.long("bind")
 			.takes_value(true)
 			.help("Adddress to bind the server to (default 0.0.0.0)"))
+		.arg(Arg::with_name("teid_prefix")
+			.short("e")
+			.long("teid_prefix")
+			.takes_value(true)
+			.help("teid prefix in client mode (default 100)"))
+		.arg(Arg::with_name("destip")
+			.short("i")
+			.long("destip")
+			.takes_value(true)
+			.help("the destination ip to send traffic (default 127.0.0.10)"))
 		.get_matches();
 
-	let buf: Vec<u8> = (0..MAX_PACKET_BYTES).map(|n| n as u8).collect();
+	let mut send_buf: Vec<u8> = (0..MAX_PACKET_SEND_BYTES).map(|n| n as u8).collect();
 
+	let mut reply_buf: Vec<u8> = (0..MAX_PACKET_REPLY_BYTES).map(|n| n as u8).collect();
+	
 	let should_run_server = matches.is_present("as-server");
 	let randomize_starts = matches.is_present("randomize-starts");
-	let num_clients = value_t!(matches, "num-clients", usize).unwrap_or(128);
+	let num_clients = value_t!(matches, "num-clients", usize).unwrap_or(1);
 	let duration_seconds = value_t!(matches, "duration", u64).unwrap_or(5);
-	let tick_rate_hz = value_t!(matches, "client_tick_rate", u32).unwrap_or(10);
+	let tick_rate_hz = value_t!(matches, "client_tick_rate", u32).unwrap_or(20);
 	let server_host = value_t!(matches, "host", String).unwrap_or("127.0.0.1".to_string());
-	let server_port = value_t!(matches, "port", u16).unwrap_or(55777);
+	let server_port = value_t!(matches, "port", u16).unwrap_or(2152);
 	let bind_addr = value_t!(matches, "bind_addr", String).unwrap_or("0.0.0.0".to_string());
+	let teid_prefix = value_t!(matches, "teid_prefix", u8).unwrap_or(100);
+	let destip = value_t!(matches, "destip", String).unwrap_or("127.0.0.10".to_string());
+
+	
+
+	
 
 	if should_run_server {
-		run_server(&bind_addr, server_port, buf, num_clients);
+		reply_buf[0] = 0x30;
+		reply_buf[1] = 0xff;
+		reply_buf[2] = 0x05;
+		reply_buf[3] = 0x74;
+		reply_buf[4] = teid_prefix;
+		reply_buf[5] = 0x00;
+
+
+		reply_buf[1404] = 0x00;
+		reply_buf[1405] = 0x06;
+
+
+		let addr = Ipv4Addr::from_str(&destip).unwrap();
+
+		let addr_u32: u32 = addr.into();
+
+		
+		let mut reply_buf_view = BufViewMut::wrap(&mut reply_buf);
+		reply_buf_view.set_u32(1406, addr_u32);
+		
+
+		reply_buf[1410] = 0x08;
+		reply_buf[1411] = 0x68;
+
+		run_server(&bind_addr, server_port, send_buf, num_clients, reply_buf);
 	} else {
 		let mut core = Core::new().unwrap();
 		let handle = core.handle();
+		send_buf[0] = 0x30;
+		send_buf[1] = 0xff;
+		send_buf[2] = 0x00;
+		send_buf[3] = 0x34;
+		send_buf[4] = teid_prefix;
+		send_buf[5] = 0x00;
 
 		// This timer is shared so we don't create a thread per client
 		let timer = tokio_timer::wheel().tick_duration(Duration::from_millis(10)).build();
@@ -288,7 +361,7 @@ fn main() {
 			let (tx, rx) = oneshot::channel::<_>(); // The client will send its result on this channel when finished
 			client_chans.push(rx);
 
-			run_client(&server_host, server_port, &buf, n as u16, randomize_starts, run_duration, tick_rate_hz, timer.clone(), handle.clone(), tx);
+			run_client(&bind_addr, &server_host, server_port, &send_buf, n as u16, randomize_starts, run_duration, tick_rate_hz, timer.clone(), handle.clone(), tx);
 		}
 
 		let client_results = client_chans.iter_mut().map(|rx| {
