@@ -24,7 +24,8 @@ use std::time::Duration;
 use clap::{Arg, App};
 
 use rand::{thread_rng, Rng};
-
+use std::mem::{self};
+use std::os::unix::io::AsRawFd;
 //use byteorder::{ByteOrder, LittleEndian};
 
 use tokio_core::reactor::{Core, Handle};
@@ -130,6 +131,9 @@ fn run_server(bind_addr: &str, server_port: u16, _buf: Vec<u8>, num_clients: usi
 	let handle = core.handle();
 
 	let socket = UdpSocket::bind(&addr, &handle).unwrap();
+
+
+
 	println!("Listening on: {} with max of {} clients", addr, num_clients);
 
 	let (sink, stream) = socket.framed(ServerCodec).split();
